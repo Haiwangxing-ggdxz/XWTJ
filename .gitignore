@@ -1,7 +1,7 @@
 # 项目特定文件夹
 Initial_data/*
 __pycache__/
-
+Results/
 # Python
 *.py[cod]
 *$py.class
