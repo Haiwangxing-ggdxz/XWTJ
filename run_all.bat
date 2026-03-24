@@ -4,8 +4,8 @@ cd /d "%~dp0"
 call conda activate Tensorflow
 
 pushd "%~dp0Recall"
-@REM call python Recall_itemcf.py
-@REM call python DSSM_recall.py
+call python Recall_itemcf.py
+call python DSSM_recall.py
 call python Recall_merge.py
 popd
 
