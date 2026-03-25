@@ -320,8 +320,9 @@ def validate_data(trn_df, tst_df, dense_fea, sparse_fea, behavior_fea):
     assert not np.isinf(tst_df[dense_fea + sparse_fea + behavior_fea].values).any(), "测试集包含Inf值"
 
 
-def get_din_feature_columns(df, dense_fea, sparse_fea, his_behavior_fea,
-                           emb_dim=32, max_len=100):
+# ++ 新增函数：基于全量数据统一构建特征列（只需调用一次）
+def build_feature_columns(full_df, dense_fea, sparse_fea, his_behavior_fea,
+                          emb_dim=32, max_len=100):
     """
     构建DIN模型的特征列配置
 
@@ -330,10 +331,14 @@ def get_din_feature_columns(df, dense_fea, sparse_fea, his_behavior_fea,
     2. DenseFeat: 数值型特征（分桶后转为sparse处理）
     3. VarLenSparseFeat: 变长序列特征（用户历史行为序列）
 
+    vocab_size 必须基于全量数据（训练集 + 测试集）统一计算，
+    确保所有数据子集（各折训练集、验证集、测试集）使用相同的
+    embedding 维度，避免 embedding 越界或各子集维度不一致的问题。
+
     Parameters:
     -----------
-    df : pd.DataFrame
-        数据集
+    full_df : pd.DataFrame
+        全量数据（训练集 + 测试集合并后）
     dense_fea : list
         数值型特征列
     sparse_fea : list
@@ -347,13 +352,25 @@ def get_din_feature_columns(df, dense_fea, sparse_fea, his_behavior_fea,
 
     Returns:
     --------
-    tuple: (x, dnn_feature_columns)
-        - x: 模型输入字典
-        - dnn_feature_columns: 特征列配置列表
+    list: dnn_feature_columns - 特征列配置列表
     """
+    # 用最大索引值计算词表大小，避免ID非连续时出现embedding越界
+    sparse_vocab_sizes = {}
+    for feat in sparse_fea:
+        feat_max = pd.to_numeric(full_df[feat], errors='coerce').max()
+        feat_max = 0 if pd.isna(feat_max) else int(feat_max)
+        sparse_vocab_sizes[feat] = max(feat_max + 1, 2)
+
+    # article_id 和 hist_article_id 共享 embedding，词表需覆盖两者最大 ID
+    article_max = pd.to_numeric(full_df['article_id'], errors='coerce').max()
+    article_max = 0 if pd.isna(article_max) else int(article_max)
+    hist_max = pd.to_numeric(full_df['hist_article_id'].explode(), errors='coerce').max()
+    hist_max = 0 if pd.isna(hist_max) else int(hist_max)
+    article_vocab_size = max(article_max, hist_max) + 1
+
     # Sparse特征：为每个离散特征创建Embedding配置
     sparse_feature_columns = [
-        SparseFeat(feat, vocabulary_size=df[feat].nunique() + 1, embedding_dim=emb_dim)
+        SparseFeat(feat, vocabulary_size=sparse_vocab_sizes[feat], embedding_dim=emb_dim)
         for feat in sparse_fea
     ]
 
@@ -368,7 +385,7 @@ def get_din_feature_columns(df, dense_fea, sparse_fea, his_behavior_fea,
         VarLenSparseFeat(
             SparseFeat(
                 feat,
-                vocabulary_size=df['article_id'].nunique() + 1,
+                vocabulary_size=article_vocab_size,
                 embedding_dim=emb_dim,
                 embedding_name='article_id'  # 与候选article_id共享Embedding
             ),
@@ -380,6 +397,32 @@ def get_din_feature_columns(df, dense_fea, sparse_fea, his_behavior_fea,
     # 合并所有特征列
     dnn_feature_columns = sparse_feature_columns + dense_feature_columns + var_feature_columns
 
+    return dnn_feature_columns
+
+
+# ++ 新增函数：基于数据子集构建模型输入字典
+def build_model_input(df, dnn_feature_columns, his_behavior_fea, max_len=100):
+    """
+    基于给定数据子集构建模型输入字典
+
+    feature_columns 已在外部由 build_feature_columns 统一生成并固定，
+    此函数只负责从 df 中取值并对序列特征做 padding。
+
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        当前数据子集（训练集/验证集/测试集）
+    dnn_feature_columns : list
+        特征列配置（由 build_feature_columns 统一生成）
+    his_behavior_fea : list
+        历史行为特征列（变长序列）
+    max_len : int
+        序列最大长度
+
+    Returns:
+    --------
+    dict: 模型输入字典 x
+    """
     # 构建模型输入字典
     x = {}
     for name in get_feature_names(dnn_feature_columns):
@@ -390,7 +433,7 @@ def get_din_feature_columns(df, dense_fea, sparse_fea, his_behavior_fea,
         else:
             x[name] = df[name].values
 
-    return x, dnn_feature_columns
+    return x
 
 
 def get_kfold_users(trn_df, n=5):
@@ -441,10 +484,16 @@ def train_din_model(trn_df, tst_df, sparse_fea, dense_fea, hist_behavior_fea,
         - df_oof: 训练集OOF预测结果
         - prediction: 测试集预测结果
     """
-    # 准备测试集输入
-    x_tst, dnn_feature_columns = get_din_feature_columns(
-        tst_df, dense_fea, sparse_fea, hist_behavior_fea, max_len=max_len
+    # ++ 新增：合并全量数据，基于全量统一计算一次 feature_columns
+    full_df = pd.concat([trn_df, tst_df], axis=0, ignore_index=True)
+    dnn_feature_columns = build_feature_columns(
+        full_df, dense_fea, sparse_fea, hist_behavior_fea, max_len=max_len
     )
+
+    # ++ 修改：测试集输入只调用 build_model_input，feature_columns 复用上面统一生成的
+    # -- 删除：x_tst, dnn_feature_columns = get_din_feature_columns(
+    # --           tst_df, dense_fea, sparse_fea, hist_behavior_fea, max_len=max_len)
+    x_tst = build_model_input(tst_df, dnn_feature_columns, hist_behavior_fea, max_len=max_len)
 
     # 初始化预测结果容器
     prediction = tst_df[['user_id', 'article_id']].copy()
@@ -467,15 +516,15 @@ def train_din_model(trn_df, tst_df, sparse_fea, dense_fea, hist_behavior_fea,
         train_idx = trn_df[~trn_df['user_id'].isin(valid_users)]
         valid_idx = trn_df[trn_df['user_id'].isin(valid_users)]
 
-        # 准备特征输入
-        x_trn, _ = get_din_feature_columns(
-            train_idx, dense_fea, sparse_fea, hist_behavior_fea, max_len=max_len
-        )
+        # ++ 修改：只调用 build_model_input，复用统一生成的 feature_columns
+        # -- 删除：x_trn, _ = get_din_feature_columns(
+        # --           train_idx, dense_fea, sparse_fea, hist_behavior_fea, max_len=max_len)
+        x_trn = build_model_input(train_idx, dnn_feature_columns, hist_behavior_fea, max_len=max_len)
         y_trn = train_idx['label'].values
 
-        x_val, _ = get_din_feature_columns(
-            valid_idx, dense_fea, sparse_fea, hist_behavior_fea, max_len=max_len
-        )
+        # -- 删除：x_val, _ = get_din_feature_columns(
+        # --           valid_idx, dense_fea, sparse_fea, hist_behavior_fea, max_len=max_len)
+        x_val = build_model_input(valid_idx, dnn_feature_columns, hist_behavior_fea, max_len=max_len)
         y_val = valid_idx['label'].values
 
         # 构建DIN模型
