@@ -14,7 +14,7 @@ deepctr==0.9.3
 deepmatch==0.3.0
 
 # 向量检索
-faiss==1.9.0
+faiss-cpu==1.9.0
 
 # 机器学习
 scikit-learn==1.6.0

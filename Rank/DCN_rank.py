@@ -37,7 +37,6 @@ warnings.filterwarnings('ignore')
 
 
 # ==================== 路径配置 ====================
-# 相对于 Code/Rank 目录的路径
 FEAT_ENG_PATH = Path('../Results/Feat_ENG')
 DATA_PATH = Path('../Initial_data')
 SUBMIT_PATH = Path('../Results/submit')
@@ -45,20 +44,19 @@ LOG_PATH = Path('../Results/log')
 
 
 # ==================== 参数配置 ====================
-RECALL_NUM = 501         # 召回阶段保留的候选数量
-MAX_LEN = 5             # 用户历史行为序列的最大长度
-EMB_DIM = 32            # Embedding维度
-N_BINS = 100            # Dense特征分桶数量
-K_FOLD = 5              # 交叉验证折数
-BATCH_SIZE = 256        # 训练批次大小
-EPOCHS = 10             # 训练轮数
-PATIENCE = 5            # 早停耐心值
+RECALL_NUM = 50
+MAX_LEN = 5
+EMB_DIM = 32
+N_BINS = 100
+K_FOLD = 5
+BATCH_SIZE = 256
+EPOCHS = 2
+PATIENCE = 5
 
 # ==================== DEBUG模式配置 ====================
-# DEBUG_MODE = True 时，只使用少量数据快速验证代码正确性
 DEBUG_MODE = False
-DEBUG_MAX_USERS = 1000      # DEBUG模式下最大用户数量
-DEBUG_EPOCHS = 1            # DEBUG模式下训练轮数
+DEBUG_MAX_USERS = 1000
+DEBUG_EPOCHS = 1
 
 
 def setup_logger():
@@ -326,26 +324,20 @@ def validate_data(trn_df, tst_df, dense_fea, sparse_fea):
     assert not np.isinf(tst_df[dense_fea + sparse_fea].values).any(), "测试集包含Inf值"
 
 
-def get_dcn_feature_columns(df, dense_fea, sparse_fea, hist_behavior_fea,
+# ++ 新增函数：基于全量数据统一构建特征列（只调用一次）
+def build_feature_columns(full_df, dense_fea, sparse_fea, hist_behavior_fea,
                            emb_dim=32, max_len=30):
     """
-    构建DCN模型的特征列配置
+    基于全量数据构建特征列配置（只需调用一次）
 
-    DCNMix需要两组特征列：
-    1. dnn_feature_columns: 用于Deep网络（标准DNN层）
-    2. linear_feature_columns: 用于Cross网络（显式特征交叉）
-
-    通常两组使用相同的特征列。
-
-    特征类型：
-    - SparseFeat: 离散型特征（如user_id, article_id）
-    - DenseFeat: 数值型特征（分桶后转为sparse处理）
-    - VarLenSparseFeat: 变长序列特征（用户历史行为序列）
+    vocab_size 必须基于全量数据（训练集 + 测试集）统一计算，
+    确保所有数据子集（各折训练集、验证集、测试集）使用相同的
+    embedding 维度，避免 embedding 越界或各子集维度不一致的问题。
 
     Parameters:
     -----------
-    df : pd.DataFrame
-        数据集
+    full_df : pd.DataFrame
+        全量数据（训练集 + 测试集合并后）
     dense_fea : list
         数值型特征列
     sparse_fea : list
@@ -353,28 +345,25 @@ def get_dcn_feature_columns(df, dense_fea, sparse_fea, hist_behavior_fea,
     hist_behavior_fea : list
         历史行为特征列（变长序列）
     emb_dim : int
-        Embedding维度
+        Embedding 维度
     max_len : int
-        序列最大长度（用于padding）
+        序列最大长度
 
     Returns:
     --------
-    tuple: (x, dnn_feature_columns, linear_feature_columns)
-        - x: 模型输入字典
-        - dnn_feature_columns: Deep网络特征列配置
-        - linear_feature_columns: Cross网络特征列配置
+    tuple: (dnn_feature_columns, linear_feature_columns)
     """
-    # 用最大索引值计算词表大小，避免ID非连续时出现embedding越界
+    # 基于全量数据计算每个 sparse 特征的 vocab size
     sparse_vocab_sizes = {}
     for feat in sparse_fea:
-        feat_max = pd.to_numeric(df[feat], errors='coerce').max()
+        feat_max = pd.to_numeric(full_df[feat], errors='coerce').max()
         feat_max = 0 if pd.isna(feat_max) else int(feat_max)
         sparse_vocab_sizes[feat] = max(feat_max + 1, 2)
 
-    # article_id和hist_article_id共享同一套embedding，词表需覆盖两边最大ID
-    article_max = pd.to_numeric(df['article_id'], errors='coerce').max()
+    # article_id 和 hist_article_id 共享 embedding，词表需覆盖两者最大 ID
+    article_max = pd.to_numeric(full_df['article_id'], errors='coerce').max()
     article_max = 0 if pd.isna(article_max) else int(article_max)
-    hist_max = pd.to_numeric(df['hist_article_id'].explode(), errors='coerce').max()
+    hist_max = pd.to_numeric(full_df['hist_article_id'].explode(), errors='coerce').max()
     hist_max = 0 if pd.isna(hist_max) else int(hist_max)
     article_vocab_size = max(article_max, hist_max) + 1
 
@@ -396,7 +385,7 @@ def get_dcn_feature_columns(df, dense_fea, sparse_fea, hist_behavior_fea,
                 feat,
                 vocabulary_size=article_vocab_size,
                 embedding_dim=emb_dim,
-                embedding_name='article_id'  # 与候选article_id共享Embedding
+                embedding_name='article_id'  # 与候选 article_id 共享 Embedding
             ),
             maxlen=max_len
         )
@@ -409,7 +398,32 @@ def get_dcn_feature_columns(df, dense_fea, sparse_fea, hist_behavior_fea,
     # DCN的Cross网络使用相同的特征列
     linear_feature_columns = dnn_feature_columns
 
-    # 构建模型输入字典
+    return dnn_feature_columns, linear_feature_columns
+
+
+# ++ 新增函数：基于数据子集构建模型输入字典
+def build_model_input(df, dnn_feature_columns, hist_behavior_fea, max_len=30):
+    """
+    基于给定数据子集构建模型输入字典
+
+    feature_columns 已在外部由 build_feature_columns 统一生成并固定，
+    此函数只负责从 df 中取值并对序列特征做 padding。
+
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        当前数据子集（训练集/验证集/测试集）
+    dnn_feature_columns : list
+        特征列配置（由 build_feature_columns 统一生成）
+    hist_behavior_fea : list
+        历史行为特征列（变长序列）
+    max_len : int
+        序列最大长度
+
+    Returns:
+    --------
+    dict: 模型输入字典 x
+    """
     x = {}
     for name in get_feature_names(dnn_feature_columns):
         if name in hist_behavior_fea:
@@ -418,8 +432,7 @@ def get_dcn_feature_columns(df, dense_fea, sparse_fea, hist_behavior_fea,
             x[name] = pad_sequences(his_list, maxlen=max_len, padding='post')
         else:
             x[name] = df[name].values
-
-    return x, dnn_feature_columns, linear_feature_columns
+    return x
 
 
 def get_kfold_users(trn_df, n=5):
@@ -446,36 +459,19 @@ def train_dcn_model(trn_df, tst_df, sparse_fea, dense_fea, hist_behavior_fea,
                     max_len, log, debug_mode=False, debug_epochs=None):
     """
     使用5折交叉验证训练DCN模型
-
-    Parameters:
-    -----------
-    trn_df : pd.DataFrame
-        训练集
-    tst_df : pd.DataFrame
-        测试集（用于预测）
-    sparse_fea, dense_fea, hist_behavior_fea : list
-        各类特征列
-    max_len : int
-        序列最大长度
-    log : logger
-        日志记录器
-    debug_mode : bool
-        DEBUG模式标志
-    debug_epochs : int
-        DEBUG模式下的训练轮数
-
-    Returns:
-    --------
-    tuple: (df_oof, prediction)
-        - df_oof: 训练集OOF预测结果
-        - prediction: 测试集预测结果
     """
-    # 准备测试集输入
-    x_tst, dnn_feature_columns, linear_feature_columns = get_dcn_feature_columns(
-        tst_df, dense_fea, sparse_fea, hist_behavior_fea, max_len=max_len
+    # ++ 新增：合并全量数据，基于全量统一计算一次 feature_columns
+    # -- 删除：原来在函数内用 tst_df 单独计算 feature_columns 的逻辑
+    full_df = pd.concat([trn_df, tst_df], axis=0, ignore_index=True)
+    dnn_feature_columns, linear_feature_columns = build_feature_columns(
+        full_df, dense_fea, sparse_fea, hist_behavior_fea, max_len=max_len
     )
 
-    # 初始化预测结果容器
+    # ++ 修改：测试集输入只调用 build_model_input，feature_columns 复用上面统一生成的
+    # -- 删除：x_tst, dnn_feature_columns, linear_feature_columns = get_dcn_feature_columns(
+    # --           tst_df, dense_fea, sparse_fea, hist_behavior_fea, max_len=max_len)
+    x_tst = build_model_input(tst_df, dnn_feature_columns, hist_behavior_fea, max_len=max_len)
+
     prediction = tst_df[['user_id', 'article_id']].copy()
     prediction['pred'] = 0
     oof_list = []
@@ -485,7 +481,7 @@ def train_dcn_model(trn_df, tst_df, sparse_fea, dense_fea, hist_behavior_fea,
 
     # DEBUG模式下减少折数
     if debug_mode:
-        user_set = user_set[:2]  # 只使用2折
+        user_set = user_set[:2]
         log.info(f"[DEBUG模式] 交叉验证折数限制为: {len(user_set)}")
 
     # 每折训练和预测
@@ -496,15 +492,15 @@ def train_dcn_model(trn_df, tst_df, sparse_fea, dense_fea, hist_behavior_fea,
         train_idx = trn_df[~trn_df['user_id'].isin(valid_users)]
         valid_idx = trn_df[trn_df['user_id'].isin(valid_users)]
 
-        # 准备特征输入
-        x_trn, _, _ = get_dcn_feature_columns(
-            train_idx, dense_fea, sparse_fea, hist_behavior_fea, max_len=max_len
-        )
+        # ++ 修改：只调用 build_model_input，复用统一生成的 feature_columns
+        # -- 删除：x_trn, _, _ = get_dcn_feature_columns(
+        # --           train_idx, dense_fea, sparse_fea, hist_behavior_fea, max_len=max_len)
+        x_trn = build_model_input(train_idx, dnn_feature_columns, hist_behavior_fea, max_len=max_len)
         y_trn = train_idx['label'].values
 
-        x_val, _, _ = get_dcn_feature_columns(
-            valid_idx, dense_fea, sparse_fea, hist_behavior_fea, max_len=max_len
-        )
+        # -- 删除：x_val, _, _ = get_dcn_feature_columns(
+        # --           valid_idx, dense_fea, sparse_fea, hist_behavior_fea, max_len=max_len)
+        x_val = build_model_input(valid_idx, dnn_feature_columns, hist_behavior_fea, max_len=max_len)
         y_val = valid_idx['label'].values
 
         # 构建DCNMix模型
