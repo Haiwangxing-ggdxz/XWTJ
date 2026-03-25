@@ -51,7 +51,7 @@ EMB_DIM = 32            # Embedding维度
 N_BINS = 100            # Dense特征分桶数量
 K_FOLD = 5              # 交叉验证折数
 BATCH_SIZE = 256        # 训练批次大小
-EPOCHS = 1             # 训练轮数
+EPOCHS = 10             # 训练轮数
 PATIENCE = 5            # 早停耐心值
 
 # ==================== DEBUG模式配置 ====================
