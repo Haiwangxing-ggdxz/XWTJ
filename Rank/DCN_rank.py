@@ -45,13 +45,13 @@ LOG_PATH = Path('../Results/log')
 
 
 # ==================== 参数配置 ====================
-RECALL_NUM = 50         # 召回阶段保留的候选数量
+RECALL_NUM = 501         # 召回阶段保留的候选数量
 MAX_LEN = 5             # 用户历史行为序列的最大长度
 EMB_DIM = 32            # Embedding维度
 N_BINS = 100            # Dense特征分桶数量
 K_FOLD = 5              # 交叉验证折数
 BATCH_SIZE = 256        # 训练批次大小
-EPOCHS = 10             # 训练轮数
+EPOCHS = 1             # 训练轮数
 PATIENCE = 5            # 早停耐心值
 
 # ==================== DEBUG模式配置 ====================
@@ -364,9 +364,23 @@ def get_dcn_feature_columns(df, dense_fea, sparse_fea, hist_behavior_fea,
         - dnn_feature_columns: Deep网络特征列配置
         - linear_feature_columns: Cross网络特征列配置
     """
+    # 用最大索引值计算词表大小，避免ID非连续时出现embedding越界
+    sparse_vocab_sizes = {}
+    for feat in sparse_fea:
+        feat_max = pd.to_numeric(df[feat], errors='coerce').max()
+        feat_max = 0 if pd.isna(feat_max) else int(feat_max)
+        sparse_vocab_sizes[feat] = max(feat_max + 1, 2)
+
+    # article_id和hist_article_id共享同一套embedding，词表需覆盖两边最大ID
+    article_max = pd.to_numeric(df['article_id'], errors='coerce').max()
+    article_max = 0 if pd.isna(article_max) else int(article_max)
+    hist_max = pd.to_numeric(df['hist_article_id'].explode(), errors='coerce').max()
+    hist_max = 0 if pd.isna(hist_max) else int(hist_max)
+    article_vocab_size = max(article_max, hist_max) + 1
+
     # Sparse特征：为每个离散特征创建Embedding配置
     sparse_feature_columns = [
-        SparseFeat(feat, vocabulary_size=df[feat].nunique() + 1, embedding_dim=emb_dim)
+        SparseFeat(feat, vocabulary_size=sparse_vocab_sizes[feat], embedding_dim=emb_dim)
         for feat in sparse_fea
     ]
 
@@ -380,7 +394,7 @@ def get_dcn_feature_columns(df, dense_fea, sparse_fea, hist_behavior_fea,
         VarLenSparseFeat(
             SparseFeat(
                 feat,
-                vocabulary_size=df['article_id'].nunique() + 1,
+                vocabulary_size=article_vocab_size,
                 embedding_dim=emb_dim,
                 embedding_name='article_id'  # 与候选article_id共享Embedding
             ),
