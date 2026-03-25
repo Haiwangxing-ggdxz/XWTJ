@@ -50,7 +50,7 @@ EMB_DIM = 32
 N_BINS = 100
 K_FOLD = 5
 BATCH_SIZE = 256
-EPOCHS = 2
+EPOCHS = 10
 PATIENCE = 5
 
 # ==================== DEBUG模式配置 ====================
